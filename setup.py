@@ -3,7 +3,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='csu_fbd',
+    name='forecastr',
     version='0.0.1',
     url='https://github.com/zmjones/forecastr',
     description='wrapper for some functions in hyndmans r package',

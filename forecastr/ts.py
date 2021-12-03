@@ -15,10 +15,7 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 from scipy.special import logit, expit
 from sklearn.preprocessing import PowerTransformer, MinMaxScaler
 
-from csu_fbd.util import inverse_transform, root_mean_square_error, is_stale, parse_yearstring
-
 xr.set_options(file_cache_maxsize=1000)
-
 
 
 def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None, substitute_past=False, method='ets',
@@ -33,25 +30,8 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
     makes time series forecasts for time series grouped by variables (e.g., age group, location, sex)
     """
 
-    # get rid of draws and convert to a standardized DataFrame
-    if isinstance(da, xr.DataArray) or isinstance(da, xr.Dataset):
-        if 'draw' in da.dims:
-            da_mean = da.mean('draw')
-        else:
-            da_mean = da
-
-        if isinstance(da, xr.Dataset):
-            da = da[name]
-        
-        df = da_mean.to_dataframe(name=name).reset_index()
-    elif isinstance(da, pd.DataFrame) or isinstance(da, pd.Series):
-        df = da.reset_index()
-        if ('draw' in df.columns) & (not 'draw' in variables):
-            df = df.groupby(variables + ['year_id']).mean().reset_index().drop('draw', axis=1)
-    else:
-        raise ValueError
-
     # modify the years object if a holdout is desired, then proceed as normal
+    # TODO needs to be rewritten to not use yearrange
     if holdout is not None:
         years = YearRange(years.past_start, years.forecast_start - holdout, years.forecast_end)
 
@@ -62,6 +42,8 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
     variable_types = df[variables].dtypes.to_dict()
     # encode the index values into a column name and unstack the dataframe
     pad_size = find_pad_size(df[variables])
+
+    # TODO needs to be rewritten to use generic time index
     df = to_flat_hierarchical_df(df, name, index=['year_id'], variables=variables, pad_size=pad_size)
 
     # look for time-series with constant variance, remove them for now
@@ -126,13 +108,14 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
         pass
 
     # initialization of xreg arg for use with arima
+    # TODO make time index generic
     if xreg is not None:
         numpy2ri.activate()
         xreg = xreg.to_dataframe().unstack(xreg_code).reset_index().set_index(variables + ['year_id']).sort_index()
         coef = []
 
+    # TODO make time index generic
     concat_dim = variables + ['year_id']
-
 
     # new plan
     # do i need to loop over rdf? why not just df?
@@ -241,6 +224,8 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
             except:
                 fit = fitter(ts, **fit_args)
 
+                
+        # TODO fix all this, should output pars
         # extract model parameters
         # if method == 'ets':
         #     pars = fit.rx2('par')
@@ -299,11 +284,12 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
 
             if scale:
                 preds = preds.apply(invert_scale, axis=0)
-                
+            # TODO fix time index
             preds['year_id'] = years.years
         else:
             preds = predictor(fit, h=h, **predict_args)
             if level is not None:
+                # TODO time index
                 preds = pd.DataFrame({name: np.concatenate([fit.rx2('fitted'), preds.rx2('mean')]),
                                       'lower': np.concatenate([fit.rx2('fitted'), preds.rx2('lower')]),
                                       'upper': np.concatenate([fit.rx2('fitted'), preds.rx2('upper')]),
@@ -320,6 +306,7 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
                     preds['upper'] = invert_scale(preds[['upper']])
                     
             else:
+                # TODO time index
                 preds = pd.DataFrame({name: np.concatenate([fit.rx2('fitted'), preds.rx2('mean')]),
                                       'year_id': years.years})
                 if transform is not None:
@@ -365,6 +352,7 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
         if method == 'ets':
             par_names = [p for p in par_names if p in ['alpha', 'beta', 'phi', 'gamma']]
             params = ret.groupby(variables).mean()[par_names].reset_index()
+            # TODO remove location id reference here
             grouped_params = params.groupby([v for v in variables if v != 'location_id'] + \
                                             [p for p in par_names if p != 'beta'])['beta']
             # take quantiles across locations for the slope param
@@ -417,95 +405,6 @@ def forecast_univariate(da, years, name, variables=[], xreg=None, xreg_code=None
         
     return ret
 
-
-def arc_forecast(da, years, min_weight=0., max_weight=9.75, weight_step_size=.25, transform="logit", stat_dim="year_id", holdout=None, holdout_period=10, **kwargs):
-    """
-    does the business
-    """
-    if holdout is not None:
-        years = YearRange(years.past_start, years.forecast_start - holdout, years.forecast_end)
-        da = da.sel(dict(year_id = years.past_years))
-        
-    omega_tune = arc_weights(da, holdout_period, min_weight, max_weight, weight_step_size, transform, stat_dim)
-    forecast = arc(da, years, weight_exp=use_omega_with_lowest_rmse(omega_tune), transform=transform)
-    logger.info('arc forecast complete')
-    if transform is not None:
-        forecast = inverse_transform(da=forecast, transform=transform)
-    return da.combine_first(forecast)
-
-
-def arc_forecast_sev(sev, years, holdout_period=10, min_weight=0., max_weight=9.75, weight_step_size=.25, transform="logit",
-                     stat_dim="year_id", age_standardize=False, prefix='/ihme/csu/sev/', version=None, **kwargs):
-    """
-    forecasts sevs using forecasting's extrapolated annualized rates of change method
-    """
-    rei_id = int(sev.rei_id.values)
-    filename = f'{prefix}{rei_id}_sev_arc_forecast.nc'
-
-    sev_forecast = arc_forecast(sev, years, min_weight, max_weight, weight_step_size, transform, **kwargs)
-    sev_forecast.to_netcdf(filename)
-
-    return sev_forecast
-
-
-def arc(past, years, weight_exp=1., stat_dim='year_id', transform='logit', **kwargs):
-    """
-    computes arc forecast. past is a data array, years is a YearRange object, weight_exp is a recency weight, transform is a string
-    (either logit or log) which is applied before the arcing. the return is also a dataarray with the same coordinates except for year_id which
-    covers whatever is specified in the years arg
-    """
-    weighted = weight_exp is not None
-
-    if transform == 'log':
-        past = np.log(past)
-    elif transform == 'logit':
-        past = logit(past)
-    else:
-        pass
-
-    if 'draw' in past:
-        past_mean = past.mean('draw')
-    else:
-        past_mean = past
-    roc = past_mean.diff("year_id", n=1)
-    roc = roc.fillna(0.)
-
-    if weighted:
-        year_weights = xr.DataArray((np.arange(len(years.past_years) - 1) + 1), dims="year_id", coords={"year_id": years.past_years[1:]}) ** weight_exp
-        past_arc = weighted_mean(roc, dim=stat_dim, weights=year_weights)
-    else:
-        past_arc = roc.mean(dim=stat_dim)
-        
-    multipliers = xr.DataArray(np.arange(len(years.forecast_years)) + 1, dims=['year_id'], coords={'year_id': years.forecast_years})
-    arc_backcast = past.sel(year_id=years.past_end) + past_arc * multipliers
-    forecast_year_multipliers = xr.DataArray(np.arange(len(years.forecast_years)) + 1, dims=["year_id"], coords={"year_id": years.forecast_years})
-    forecast = past.sel(year_id=years.past_end) + past_arc * forecast_year_multipliers
-
-    return forecast
-
-
-def arc_weights(past, holdout_period=10, min_weight=0., max_weight=9.75, weight_step_size=.1, transform='logit', stat_dim='year_id', **kwargs):
-    """
-    test a number of possible year weights, estimate their out-of-sample rmse using the holdout set
-    and return a DataAarray with the rmse and associated weights
-    """
-    weights = np.arange(min_weight, max_weight, weight_step_size)
-
-    first_year = past.year_id.values.min()
-    last_year = past.year_id.values.max()
-    years = YearRange(first_year, last_year - holdout_period, last_year)
-    holdout = past.sel(year_id=years.forecast_years)
-
-    results = []
-    for weight in weights:
-        pred = arc(past, years=years, weight_exp=weight, stat_dim=stat_dim, transform=transform)
-        if transform is not None:
-            pred = inverse_transform(pred, transform)
-        measure = float(root_mean_square_error(pred, holdout))
-        results.append(measure)
-
-    logger.info('arc tuning complete')
-    return xr.DataArray(results, coords=[('weight', weights)])
 
 
 def to_flat_hierarchical_df(df, name, to_drop=[], index='year_id', variables=[], pad_size=None, padder='0'):
@@ -602,6 +501,7 @@ def extract_hts_residuals(fit, columns, years):
     new_resid = pd.DataFrame(new_resid, columns=columns)
     new_resid = new_resid[~new_resid.index.duplicated(keep='first')]
     new_resid['year_id'] = years
+    # TODO fix time index
     new_resid = new_resid.set_index('year_id')
 
     return new_resid
@@ -616,6 +516,7 @@ def extract_hts_forecast(fit, columns, years):
     preds = np.append(backcast, forecast, axis=0)
     preds = pd.DataFrame(preds, columns=columns)
     preds = preds[~preds.index.duplicated(keep='first')]
+    # TODO fix time index
     preds['year_id'] = years
     preds = preds.set_index('year_id')
 
@@ -634,14 +535,8 @@ def da_to_encoded_df(da, name, variables, to_drop, index, **kwargs):
 
 
 def get_cv_blocks(start=2000, end=2017, size=5):
+    # TODO fix time index
     return [[y for y in range(year, min([end, year + size]))] for year in range(start, end)]
-
-
-def drop_constant_column(dataframe):
-    """
-    Drops constant value columns of pandas dataframe.
-    """
-    return 
 
 
 def filter_by_code(d, variables, code, variable_types):
